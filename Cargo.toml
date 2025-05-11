@@ -23,6 +23,7 @@ semver = "1"
 libc = "0.2"
 serial_test = "3"
 tempdir = "0.3"
+tempfile = "3.19"
 
 [target.'cfg(unix)'.dev-dependencies]
 nix = { version = "0.29", features = ["fs", "signal"] }

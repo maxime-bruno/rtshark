@@ -41,10 +41,13 @@
 
 use quick_xml::events::{BytesStart, Event};
 use semver::Version;
-use std::io::{BufRead, BufReader, Error, ErrorKind, Result};
 #[cfg(target_family = "unix")]
 use std::os::unix::process::ExitStatusExt;
 use std::process::{Child, ChildStderr, ChildStdout, Command, Stdio};
+use std::{
+    ffi::OsString,
+    io::{BufRead, BufReader, Error, ErrorKind, Result},
+};
 
 /// A metadata belongs to one [Layer]. It describes one particular information about a [Packet] (example: IP source address).
 #[derive(Default, Clone, Debug, PartialEq)]
@@ -501,19 +504,19 @@ impl<'a> RTSharkBuilder {
     ///     .input_path("eth0")
     ///     .live_capture();
     /// ```
-    pub fn input_path(&mut self, path: &'a str) -> RTSharkBuilderReady<'a> {
+    pub fn input_path(&mut self, path: impl AsRef<std::path::Path>) -> RTSharkBuilderReady<'a> {
         RTSharkBuilderReady::<'a> {
-            input_path: vec![path],
+            input_path: vec![path.as_ref().to_owned()],
             live_capture: false,
             metadata_blacklist: vec![],
             metadata_whitelist: None,
             capture_filter: "",
             display_filter: "",
-            env_path: "",
+            env_path: None,
             options: vec![],
             disabled_protocols: vec![],
             enabled_protocols: vec![],
-            output_path: "",
+            output_path: None,
             decode_as: vec![],
         }
     }
@@ -591,7 +594,7 @@ impl RTSharkVersion {
 #[derive(Clone)]
 pub struct RTSharkBuilderReady<'a> {
     /// path to input source
-    input_path: Vec<&'a str>,
+    input_path: Vec<std::path::PathBuf>,
     /// activate live streaming (fifo, network interface). This activates -i option instead of -r.
     live_capture: bool,
     /// filter out (blacklist) useless metadata names, to prevent storing them in output packet structure
@@ -603,15 +606,15 @@ pub struct RTSharkBuilderReady<'a> {
     /// display filter : expression filter to match before TShark prints a packet
     display_filter: &'a str,
     /// custom environment path containing TShark application
-    env_path: &'a str,
+    env_path: Option<std::path::PathBuf>,
     /// any special options to configure protocol decoding
     options: Vec<String>,
     /// any protocols that should be explicitly disabled
     disabled_protocols: Vec<String>,
     /// any protocols that should be explicitly enabled
     enabled_protocols: Vec<String>,
-    /// path to input source
-    output_path: &'a str,
+    /// path to output
+    output_path: Option<std::path::PathBuf>,
     /// decode_as : let TShark to decode as this expression
     decode_as: Vec<&'a str>,
 }
@@ -631,9 +634,9 @@ impl<'a> RTSharkBuilderReady<'a> {
     ///     .live_capture();
     /// ```
     #[must_use]
-    pub fn input_path(&self, path: &'a str) -> Self {
+    pub fn input_path(&self, path: impl AsRef<std::path::Path>) -> Self {
         let mut new = self.clone();
-        new.input_path.push(path);
+        new.input_path.push(path.as_ref().to_owned());
         new
     }
 
@@ -759,9 +762,9 @@ impl<'a> RTSharkBuilderReady<'a> {
     ///     .env_path("/opt/local/tshark/");
     /// ```
     #[must_use]
-    pub fn env_path(&self, path: &'a str) -> Self {
+    pub fn env_path(&self, path: impl AsRef<std::path::Path>) -> Self {
         let mut new = self.clone();
-        new.env_path = path;
+        new.env_path = Some(path.as_ref().to_owned());
         new
     }
 
@@ -853,9 +856,9 @@ impl<'a> RTSharkBuilderReady<'a> {
     ///     .output_path("/tmp/out.pcap");
     /// ```
     #[must_use]
-    pub fn output_path(&self, path: &'a str) -> Self {
+    pub fn output_path(&self, path: impl AsRef<std::path::Path>) -> Self {
         let mut new = self.clone();
-        new.output_path = path;
+        new.output_path = Some(path.as_ref().to_owned());
         new
     }
 
@@ -890,16 +893,14 @@ impl<'a> RTSharkBuilderReady<'a> {
     /// let tshark: std::io::Result<rtshark::RTShark> = builder.spawn();
     /// ```
     pub fn spawn(&self) -> Result<RTShark> {
-        let mut tshark_params = self.prepare_args()?;
-
-        tshark_params.extend(&[
+        let additional_tshark_params = [
             // Packet Details Markup Language, an XML-based format for the details of a decoded packet.
             // This information is equivalent to the packet details printed with the -V option.
             "-Tpdml", // -l activate unbuffered mode, useful to print packets as they come
             "-l",
-        ]);
+        ];
 
-        let mut tshark_child = self.spawn_tshark(&tshark_params)?;
+        let mut tshark_child = self.spawn_tshark(&additional_tshark_params)?;
 
         let buf_reader = BufReader::new(tshark_child.stdout.take().unwrap());
         let stderr = BufReader::new(tshark_child.stderr.take().unwrap());
@@ -928,9 +929,7 @@ impl<'a> RTSharkBuilderReady<'a> {
     /// let _: Result<(), std::io::Error> = builder.batch();
     /// ```
     pub fn batch(&self) -> Result<()> {
-        let tshark_params = self.prepare_args()?;
-
-        let mut tshark_child = self.spawn_tshark(&tshark_params)?;
+        let mut tshark_child = self.spawn_tshark(&[])?;
 
         if !tshark_child.wait()?.success() {
             let mut stderr = BufReader::new(tshark_child.stderr.take().unwrap());
@@ -946,24 +945,11 @@ impl<'a> RTSharkBuilderReady<'a> {
         Ok(())
     }
 
-    fn spawn_tshark(&self, tshark_params: &[&str]) -> Result<Child> {
+    fn spawn_tshark(&self, additional_tshark_params: &[&str]) -> Result<Child> {
         // piping from TShark, not to load the entire output in ram...
         // spawn may fail if TShark is not found in path
 
-        let tshark_child = if self.env_path.is_empty() {
-            Command::new("tshark")
-                .args(tshark_params)
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-        } else {
-            Command::new("tshark")
-                .args(tshark_params)
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .env("PATH", self.env_path)
-                .spawn()
-        };
+        let tshark_child = self.prepare_cmd()?.args(additional_tshark_params).spawn();
 
         tshark_child.map_err(|e| match e.kind() {
             std::io::ErrorKind::NotFound => {
@@ -973,14 +959,16 @@ impl<'a> RTSharkBuilderReady<'a> {
         })
     }
 
-    /// Prepare tshark command line parameters.
-    fn prepare_args(&self) -> Result<Vec<&str>> {
-        let mut tshark_params = if self.live_capture {
-            let mut input = vec![];
-            self.input_path
-                .iter()
-                .for_each(|i| input.extend(&["-i", i]));
-            input
+    /// Prepare tshark command line.
+    fn prepare_cmd(&self) -> Result<Command> {
+        let mut cmd = Command::new("tshark");
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+
+        if self.live_capture {
+            let option = OsString::from("-i");
+            self.input_path.iter().for_each(|i| {
+                cmd.args([&option, i.as_os_str()]);
+            })
         } else {
             if self.input_path.len() > 1 {
                 return Err(std::io::Error::new(
@@ -990,18 +978,19 @@ impl<'a> RTSharkBuilderReady<'a> {
             }
 
             // test if input file exists
-            let input_path = self.input_path[0];
+            let input_path = &self.input_path[0];
             std::fs::metadata(input_path).map_err(|e| match e.kind() {
-                std::io::ErrorKind::NotFound => {
-                    std::io::Error::new(e.kind(), format!("Unable to find {}: {}", input_path, e))
-                }
+                std::io::ErrorKind::NotFound => std::io::Error::new(
+                    e.kind(),
+                    format!("Unable to find {}: {}", input_path.display(), e),
+                ),
                 _ => e,
             })?;
 
-            vec!["-r", input_path]
+            cmd.args([OsString::from("-r").as_os_str(), input_path.as_os_str()]);
         };
 
-        tshark_params.extend(&[
+        cmd.args([
             // Disable network object name resolution (such as hostname, TCP and UDP port names)
             "-n",
             // When capturing packets, TShark writes to the standard error an initial line listing the interfaces from which packets are being captured and,
@@ -1010,43 +999,47 @@ impl<'a> RTSharkBuilderReady<'a> {
             "-Q",
         ]);
 
-        if !self.output_path.is_empty() {
-            tshark_params.extend(&["-w", self.output_path]);
+        if let Some(output) = self.output_path.as_ref() {
+            cmd.args([OsString::from("-w").as_os_str(), output.as_os_str()]);
         }
 
         if self.live_capture && !self.capture_filter.is_empty() {
-            tshark_params.extend(&["-f", self.capture_filter]);
+            cmd.args(["-f", self.capture_filter]);
         }
 
         if !self.display_filter.is_empty() {
-            tshark_params.extend(&["-Y", self.display_filter]);
+            cmd.args(["-Y", self.display_filter]);
         }
 
         if !self.decode_as.is_empty() {
             for elm in self.decode_as.iter() {
-                tshark_params.extend(&["-d", elm]);
+                cmd.args(["-d", elm]);
             }
         }
 
         for option in &self.options {
-            tshark_params.extend(&["-o", option]);
+            cmd.args(["-o", option]);
         }
 
         if let Some(wl) = &self.metadata_whitelist {
             for whitelist_elem in wl {
-                tshark_params.extend(&["-e", whitelist_elem]);
+                cmd.args(["-e", whitelist_elem]);
             }
         }
 
         for protocol in &self.disabled_protocols {
-            tshark_params.extend(&["--disable-protocol", protocol]);
+            cmd.args(["--disable-protocol", protocol]);
         }
 
         for protocol in &self.enabled_protocols {
-            tshark_params.extend(&["--enable-protocol", protocol]);
+            cmd.args(["--enable-protocol", protocol]);
         }
 
-        Ok(tshark_params)
+        if let Some(env) = &self.env_path {
+            cmd.env("PATH", env.as_os_str());
+        }
+
+        Ok(cmd)
     }
 }
 
@@ -2012,19 +2005,16 @@ mod tests {
         }
     }
 
+    const TEST_PCAP: &str = "tests/traces/test.pcap";
+    const RTP_PCAP: &str = "tests/traces/rtp.pcap";
+    const TCP_FRAG_PCAP: &str = "tests/traces/tcp_fragmentation.pcap";
+    const TLS_PCAP: &str = "tests/traces/test_tls.pcap";
+    const TLS_KEY: &str = "tests/traces/test_tlskeylogfile.txt";
+
     #[test]
     fn test_rtshark_input_pcap() {
-        let pcap = include_bytes!("test.pcap");
-
-        // create temp dir and copy pcap in it
-        let tmp_dir = tempdir::TempDir::new("test_pcap").unwrap();
-        let pcap_path = tmp_dir.path().join("file.pcap");
-        let mut output = std::fs::File::create(&pcap_path).expect("unable to open file");
-        output.write_all(pcap).expect("unable to write pcap");
-        output.flush().expect("unable to flush");
-
-        // spawn tshark on it
-        let builder = RTSharkBuilder::builder().input_path(pcap_path.to_str().unwrap());
+        // spawn tshark
+        let builder = RTSharkBuilder::builder().input_path(TEST_PCAP);
 
         let mut rtshark = builder.spawn().unwrap();
 
@@ -2044,26 +2034,14 @@ mod tests {
         rtshark.kill();
 
         assert!(rtshark.pid().is_none());
-
-        tmp_dir.close().expect("Error deleting fifo dir");
     }
 
     #[test]
     fn test_rtshark_input_pcap_decode_as() {
-        // 0. prepare pcap
-        let pcap = include_bytes!("rtp.pcap");
-
-        // create temp dir and copy pcap in it
-        let tmp_dir = tempdir::TempDir::new("test_pcap").unwrap();
-        let pcap_path = tmp_dir.path().join("rtp.pcap");
-        let mut output = std::fs::File::create(&pcap_path).expect("unable to open file");
-        output.write_all(pcap).expect("unable to write pcap");
-        output.flush().expect("unable to flush");
-
         // 1. a first run without decode_as option
 
-        // spawn tshark on it
-        let builder = RTSharkBuilder::builder().input_path(pcap_path.to_str().unwrap());
+        // spawn tshark
+        let builder = RTSharkBuilder::builder().input_path(RTP_PCAP);
 
         let mut rtshark = builder.spawn().unwrap();
 
@@ -2079,7 +2057,7 @@ mod tests {
 
         // 2. a second run with decode_as option
         let builder = RTSharkBuilder::builder()
-            .input_path(pcap_path.to_str().unwrap())
+            .input_path(RTP_PCAP)
             .decode_as("udp.port==6000,rtp");
 
         let mut rtshark = builder.spawn().unwrap();
@@ -2093,25 +2071,13 @@ mod tests {
         rtshark.kill();
 
         assert!(rtshark.pid().is_none());
-
-        // 3. cleanup
-        tmp_dir.close().expect("Error deleting fifo dir");
     }
 
     #[test]
     fn test_rtshark_input_pcap_display_filter() {
-        let pcap = include_bytes!("test.pcap");
-
-        // create temp dir and copy pcap in it
-        let tmp_dir = tempdir::TempDir::new("test_pcap").unwrap();
-        let pcap_path = tmp_dir.path().join("file.pcap");
-        let mut output = std::fs::File::create(&pcap_path).expect("unable to open file");
-        output.write_all(pcap).expect("unable to write pcap");
-        output.flush().expect("unable to flush");
-
         // first pass: get a udp packet
         let builder = RTSharkBuilder::builder()
-            .input_path(pcap_path.to_str().unwrap())
+            .input_path(TEST_PCAP)
             .display_filter("udp.port == 53");
 
         let mut rtshark = builder.spawn().unwrap();
@@ -2126,7 +2092,7 @@ mod tests {
 
         // second pass: try a tcp packet
         let builder = RTSharkBuilder::builder()
-            .input_path(pcap_path.to_str().unwrap())
+            .input_path(TEST_PCAP)
             .display_filter("tcp.port == 80");
 
         let mut rtshark = builder.spawn().unwrap();
@@ -2138,24 +2104,13 @@ mod tests {
         }
 
         rtshark.kill();
-
-        tmp_dir.close().expect("Error deleting fifo dir");
     }
 
     #[test]
     fn test_rtshark_input_pcap_blacklist() {
-        let pcap = include_bytes!("test.pcap");
-
-        // create temp dir and copy pcap in it
-        let tmp_dir = tempdir::TempDir::new("test_pcap").unwrap();
-        let pcap_path = tmp_dir.path().join("file.pcap");
-        let mut output = std::fs::File::create(&pcap_path).expect("unable to open file");
-        output.write_all(pcap).expect("unable to write pcap");
-        output.flush().expect("unable to flush");
-
-        // spawn tshark on it
+        // spawn tshark
         let builder = RTSharkBuilder::builder()
-            .input_path(pcap_path.to_str().unwrap())
+            .input_path(TEST_PCAP)
             .metadata_blacklist("ip.src");
         let mut rtshark = builder.spawn().unwrap();
 
@@ -2170,24 +2125,13 @@ mod tests {
         assert!(ip.metadata("ip.dst").unwrap().value().eq("127.0.0.1"));
 
         rtshark.kill();
-
-        tmp_dir.close().expect("Error deleting fifo dir");
     }
 
     #[test]
     fn test_rtshark_input_pcap_whitelist() {
-        let pcap = include_bytes!("test.pcap");
-
-        // create temp dir and copy pcap in it
-        let tmp_dir = tempdir::TempDir::new("test_pcap").unwrap();
-        let pcap_path = tmp_dir.path().join("file.pcap");
-        let mut output = std::fs::File::create(&pcap_path).expect("unable to open file");
-        output.write_all(pcap).expect("unable to write pcap");
-        output.flush().expect("unable to flush");
-
-        // spawn tshark on it
+        // spawn tshark
         let builder = RTSharkBuilder::builder()
-            .input_path(pcap_path.to_str().unwrap())
+            .input_path(TEST_PCAP)
             .metadata_whitelist("ip.dst");
         let mut rtshark = builder.spawn().unwrap();
 
@@ -2202,24 +2146,13 @@ mod tests {
         assert!(ip.metadata("ip.dst").unwrap().value().eq("127.0.0.1"));
 
         rtshark.kill();
-
-        tmp_dir.close().expect("Error deleting fifo dir");
     }
 
     #[test]
     fn test_rtshark_input_pcap_multiple_whitelist() {
-        let pcap = include_bytes!("test.pcap");
-
-        // create temp dir and copy pcap in it
-        let tmp_dir = tempdir::TempDir::new("test_pcap").unwrap();
-        let pcap_path = tmp_dir.path().join("file.pcap");
-        let mut output = std::fs::File::create(&pcap_path).expect("unable to open file");
-        output.write_all(pcap).expect("unable to write pcap");
-        output.flush().expect("unable to flush");
-
-        // spawn tshark on it
+        // spawn tshark
         let builder = RTSharkBuilder::builder()
-            .input_path(pcap_path.to_str().unwrap())
+            .input_path(TEST_PCAP)
             .metadata_whitelist("ip.src")
             .metadata_whitelist("ip.dst");
         let mut rtshark = builder.spawn().unwrap();
@@ -2235,24 +2168,13 @@ mod tests {
         assert!(ip.metadata("ip.dst").unwrap().value().eq("127.0.0.1"));
 
         rtshark.kill();
-
-        tmp_dir.close().expect("Error deleting fifo dir");
     }
 
     #[test]
     fn test_rtshark_input_pcap_whitelist_multiple_layer() {
-        let pcap = include_bytes!("test.pcap");
-
-        // create temp dir and copy pcap in it
-        let tmp_dir = tempdir::TempDir::new("test_pcap").unwrap();
-        let pcap_path = tmp_dir.path().join("file.pcap");
-        let mut output = std::fs::File::create(&pcap_path).expect("unable to open file");
-        output.write_all(pcap).expect("unable to write pcap");
-        output.flush().expect("unable to flush");
-
-        // spawn tshark on it
+        // spawn tshark
         let builder = RTSharkBuilder::builder()
-            .input_path(pcap_path.to_str().unwrap())
+            .input_path(TEST_PCAP)
             .metadata_whitelist("ip.src")
             .metadata_whitelist("udp.dstport");
         let mut rtshark = builder.spawn().unwrap();
@@ -2269,25 +2191,14 @@ mod tests {
         assert!(ip.metadata("udp.dstport").unwrap().value().eq("53"));
 
         rtshark.kill();
-
-        tmp_dir.close().expect("Error deleting fifo dir");
     }
 
     // this test may fail if executed in parallel with other tests. Run it with --test-threads=1 option.
     #[test]
     fn test_rtshark_input_pcap_whitelist_missing_attr() {
-        let pcap = include_bytes!("test.pcap");
-
-        // create temp dir and copy pcap in it
-        let tmp_dir = tempdir::TempDir::new("test_pcap").unwrap();
-        let pcap_path = tmp_dir.path().join("file.pcap");
-        let mut output = std::fs::File::create(&pcap_path).expect("unable to open file");
-        output.write_all(pcap).expect("unable to write pcap");
-        output.flush().expect("unable to flush");
-
-        // spawn tshark on it
+        // spawn tshark
         let builder = RTSharkBuilder::builder()
-            .input_path(pcap_path.to_str().unwrap())
+            .input_path(TEST_PCAP)
             .metadata_whitelist("nosuchproto.nosuchmetadata");
         let mut rtshark = builder.spawn().unwrap();
 
@@ -2296,14 +2207,12 @@ mod tests {
         assert!(ret.is_err());
 
         rtshark.kill();
-
-        tmp_dir.close().expect("Error deleting fifo dir");
     }
 
     #[cfg(target_family = "unix")]
     #[test]
     fn test_rtshark_input_fifo() {
-        let pcap = include_bytes!("test.pcap");
+        let pcap = include_bytes!("../tests/traces/test.pcap");
 
         // create temp dir
         let tmp_dir = tempdir::TempDir::new("test_fifo").unwrap();
@@ -2345,7 +2254,7 @@ mod tests {
     #[cfg(target_family = "unix")]
     #[test]
     fn test_rtshark_input_multiple_fifo() {
-        let pcap = include_bytes!("test.pcap");
+        let pcap = include_bytes!("../tests/traces/test.pcap");
 
         // create temp dir
         let tmp_dir = tempdir::TempDir::new("test_fifo").unwrap();
@@ -2406,7 +2315,7 @@ mod tests {
     #[cfg(target_family = "unix")]
     #[test]
     fn test_rtshark_input_pcap_filter_pcap() {
-        let pcap = include_bytes!("test.pcap");
+        let pcap = include_bytes!("../tests/traces/test.pcap");
 
         // create temp dir
         let tmp_dir = tempdir::TempDir::new("test_fifo").unwrap();
@@ -2547,7 +2456,7 @@ mod tests {
     #[cfg(target_family = "unix")]
     #[test]
     fn test_rtshark_fifo_opened_then_closed() {
-        let pcap = include_bytes!("test.pcap");
+        let pcap = include_bytes!("../tests/traces/test.pcap");
 
         // create temp dir
         let tmp_dir = tempdir::TempDir::new("test_fifo").unwrap();
@@ -2626,18 +2535,9 @@ mod tests {
     #[cfg(target_family = "unix")]
     #[test]
     fn test_rtshark_set_options() {
-        let pcap = include_bytes!("tcp_fragmentation.pcap");
-
-        // create temp dir and copy pcap in it
-        let tmp_dir = tempdir::TempDir::new("test_pcap").unwrap();
-        let pcap_path = tmp_dir.path().join("file.pcap");
-        let mut output = std::fs::File::create(&pcap_path).expect("unable to open file");
-        output.write_all(pcap).expect("unable to write pcap");
-        output.flush().expect("unable to flush");
-
         // second pass: turn on relative sequence numbers
         let builder = RTSharkBuilder::builder()
-            .input_path(pcap_path.to_str().unwrap())
+            .input_path(TCP_FRAG_PCAP)
             .option("tcp.relative_sequence_numbers:true");
 
         let mut rtshark = builder.spawn().unwrap();
@@ -2662,7 +2562,7 @@ mod tests {
 
         // second pass: turn off relative sequence numbers
         let builder = RTSharkBuilder::builder()
-            .input_path(pcap_path.to_str().unwrap())
+            .input_path(TCP_FRAG_PCAP)
             .option("tcp.relative_sequence_numbers:false");
 
         let mut rtshark = builder.spawn().unwrap();
@@ -2685,25 +2585,14 @@ mod tests {
         }
 
         rtshark.kill();
-
-        tmp_dir.close().expect("Error deleting fifo dir");
     }
 
     #[cfg(target_family = "unix")]
     #[test]
     fn test_rtshark_set_disabled_protocols() {
-        let pcap = include_bytes!("tcp_fragmentation.pcap");
-
-        // create temp dir and copy pcap in it
-        let tmp_dir = tempdir::TempDir::new("test_pcap").unwrap();
-        let pcap_path = tmp_dir.path().join("file.pcap");
-        let mut output = std::fs::File::create(&pcap_path).expect("unable to open file");
-        output.write_all(pcap).expect("unable to write pcap");
-        output.flush().expect("unable to flush");
-
         // turn off tcp and sip protocols
         let builder = RTSharkBuilder::builder()
-            .input_path(pcap_path.to_str().unwrap())
+            .input_path(TCP_FRAG_PCAP)
             .disable_protocol("tcp")
             .disable_protocol("sip");
 
@@ -2718,25 +2607,14 @@ mod tests {
         }
 
         rtshark.kill();
-
-        tmp_dir.close().expect("Error deleting fifo dir");
     }
 
     #[cfg(target_family = "unix")]
     #[test]
     fn test_rtshark_set_enabled_protocols() {
-        let pcap = include_bytes!("tcp_fragmentation.pcap");
-
-        // create temp dir and copy pcap in it
-        let tmp_dir = tempdir::TempDir::new("test_pcap").unwrap();
-        let pcap_path = tmp_dir.path().join("file.pcap");
-        let mut output = std::fs::File::create(&pcap_path).expect("unable to open file");
-        output.write_all(pcap).expect("unable to write pcap");
-        output.flush().expect("unable to flush");
-
         // turn off everything except eth and ip
         let builder = RTSharkBuilder::builder()
-            .input_path(pcap_path.to_str().unwrap())
+            .input_path(TCP_FRAG_PCAP)
             .disable_protocol("ALL")
             .enable_protocol("eth")
             .enable_protocol("ip");
@@ -2753,8 +2631,6 @@ mod tests {
         }
 
         rtshark.kill();
-
-        tmp_dir.close().expect("Error deleting fifo dir");
     }
 
     #[test]
@@ -2790,21 +2666,14 @@ mod tests {
 
     #[test]
     fn test_rtshark_input_pcap_output_pcap() {
-        let pcap = include_bytes!("test.pcap");
-
-        // create temp dir and copy pcap in it
-        let tmp_dir = tempdir::TempDir::new("test_pcap").unwrap();
-        let in_path = tmp_dir.path().join("in.pcap");
-        let mut output = std::fs::File::create(&in_path).expect("unable to open file");
-        output.write_all(pcap).expect("unable to write pcap");
-        output.flush().expect("unable to flush");
-
-        let out_path = tmp_dir.path().join("out.pcap");
+        let output =
+            tempfile::NamedTempFile::with_suffix(".pcap").expect("Unable to create output file");
+        let out_path = output.path();
 
         // spawn tshark on it
         let builder = RTSharkBuilder::builder()
-            .input_path(in_path.to_str().unwrap())
-            .output_path(out_path.to_str().unwrap());
+            .input_path(TEST_PCAP)
+            .output_path(out_path);
 
         let mut rtshark = builder.spawn().unwrap();
 
@@ -2827,7 +2696,7 @@ mod tests {
 
         // now check what was written
         let mut rtshark = RTSharkBuilder::builder()
-            .input_path(out_path.to_str().unwrap())
+            .input_path(out_path)
             .spawn()
             .unwrap();
 
@@ -2838,14 +2707,12 @@ mod tests {
         }
 
         rtshark.kill();
-
-        tmp_dir.close().expect("Error deleting fifo dir");
     }
 
     #[cfg(target_family = "unix")]
     #[test]
     fn test_rtshark_input_fifo_output_pcap() {
-        let pcap = include_bytes!("test.pcap");
+        let pcap = include_bytes!("../tests/traces/test.pcap");
 
         // create temp dir
         let tmp_dir = tempdir::TempDir::new("test_fifo").unwrap();
@@ -2903,21 +2770,14 @@ mod tests {
     #[test]
     #[serial] // Run test serially to limit check to multiple spawns in test
     fn test_rtshark_multiple_spawn_pcap() {
-        let pcap = include_bytes!("test.pcap");
-
-        // create temp dir and copy pcap in it
-        let tmp_dir = tempdir::TempDir::new("test_pcap").unwrap();
-        let in_path = tmp_dir.path().join("in.pcap");
-        let mut output = std::fs::File::create(&in_path).expect("unable to open file");
-        output.write_all(pcap).expect("unable to write pcap");
-        output.flush().expect("unable to flush");
-
-        let out_path = tmp_dir.path().join("out.pcap");
+        let output =
+            tempfile::NamedTempFile::with_suffix(".pcap").expect("Unable to create output file");
+        let out_path = output.path();
 
         // spawn tshark on it
         let builder = RTSharkBuilder::builder()
-            .input_path(in_path.to_str().unwrap())
-            .output_path(out_path.to_str().unwrap());
+            .input_path(TEST_PCAP)
+            .output_path(out_path);
 
         let mut rtshark = builder.spawn().unwrap();
 
@@ -2939,28 +2799,18 @@ mod tests {
         }
 
         rtshark.kill();
-
-        /* remove fifo & tempdir */
-        tmp_dir.close().expect("Error deleting fifo dir");
     }
 
     #[test]
     fn test_rtshark_timestamp_micros() {
-        let pcap = include_bytes!("test.pcap");
-
-        // create temp dir and copy pcap in it
-        let tmp_dir = tempdir::TempDir::new("test_pcap").unwrap();
-        let in_path = tmp_dir.path().join("in.pcap");
-        let mut output = std::fs::File::create(&in_path).expect("unable to open file");
-        output.write_all(pcap).expect("unable to write pcap");
-        output.flush().expect("unable to flush");
-
-        let out_path = tmp_dir.path().join("out.pcap");
+        let output =
+            tempfile::NamedTempFile::with_suffix(".pcap").expect("Unable to create output file");
+        let out_path = output.path();
 
         // spawn tshark on it
         let builder = RTSharkBuilder::builder()
-            .input_path(in_path.to_str().unwrap())
-            .output_path(out_path.to_str().unwrap());
+            .input_path(TEST_PCAP)
+            .output_path(out_path);
 
         let mut rtshark = builder.spawn().unwrap();
 
@@ -2971,25 +2821,12 @@ mod tests {
         }
 
         rtshark.kill();
-
-        /* remove fifo & tempdir */
-        tmp_dir.close().expect("Error deleting fifo dir");
     }
 
     #[test]
     fn test_rtshark_tls_keylogfile_pcap() {
-        let pcap = include_bytes!("test_tls.pcap");
-        let keylog = include_bytes!("test_tlskeylogfile.txt");
-
-        // create temp dir and copy pcap in it
-        let tmp_dir = tempdir::TempDir::new("test_pcap").unwrap();
-        let pcap_path = tmp_dir.path().join("file.pcap");
-        let mut output = std::fs::File::create(&pcap_path).expect("unable to open file");
-        output.write_all(pcap).expect("unable to write pcap");
-        output.flush().expect("unable to flush");
-
         // spawn tshark on it
-        let builder = RTSharkBuilder::builder().input_path(pcap_path.to_str().unwrap());
+        let builder = RTSharkBuilder::builder().input_path(TLS_PCAP);
 
         let mut rtshark = builder.spawn().unwrap();
 
@@ -3007,14 +2844,9 @@ mod tests {
 
         rtshark.kill();
 
-        let keylog_path = tmp_dir.path().join("keylogfile.txt");
-        let mut output = std::fs::File::create(&keylog_path).expect("unable to open file");
-        output.write_all(keylog).expect("unable to write pcap");
-        output.flush().expect("unable to flush");
-
         let builder = RTSharkBuilder::builder()
-            .input_path(pcap_path.to_str().unwrap())
-            .keylog_file(keylog_path.as_os_str().to_str().unwrap());
+            .input_path(TLS_PCAP)
+            .keylog_file(TLS_KEY);
 
         let mut rtshark = builder.spawn().unwrap();
 
@@ -3038,23 +2870,13 @@ mod tests {
         rtshark.kill();
 
         assert!(rtshark.pid().is_none());
-        tmp_dir.close().expect("Error deleting fifo dir");
     }
 
     #[test]
     fn test_reassembled_tcp() {
-        let pcap = include_bytes!("tcp_fragmentation.pcap");
-
-        // create temp dir and copy pcap in it
-        let tmp_dir = tempdir::TempDir::new("test_pcap").unwrap();
-        let pcap_path = tmp_dir.path().join("file.pcap");
-        let mut output = std::fs::File::create(&pcap_path).expect("unable to open file");
-        output.write_all(pcap).expect("unable to write pcap");
-        output.flush().expect("unable to flush");
-
         // spawn tshark on it
         let builder = RTSharkBuilder::builder()
-            .input_path(pcap_path.to_str().unwrap())
+            .input_path(TCP_FRAG_PCAP)
             // The ClientHello is the fragmented message
             .display_filter("tls.handshake.type == 1");
 
@@ -3074,7 +2896,6 @@ mod tests {
 
         rtshark.kill();
         assert!(rtshark.pid().is_none());
-        tmp_dir.close().expect("Error deleting fifo dir");
     }
 
     #[test]
@@ -3085,31 +2906,26 @@ mod tests {
 
     #[test]
     fn test_batch() {
-        let pcap = include_bytes!("test.pcap");
-
-        // create temp dir and copy pcap in it
-        let tmp_dir = tempdir::TempDir::new("test_pcap").unwrap();
-        let original = tmp_dir.path().join("original.pcap");
-        std::fs::write(&original, pcap).unwrap();
-
-        let normalized = tmp_dir.path().join("normalized.pcap");
+        let normalized = tempfile::NamedTempFile::with_suffix(".pcap")
+            .expect("Unable to create the normalized file");
 
         // Spawn tshark on it to normalize the input.
         RTSharkBuilder::builder()
-            .input_path(original.to_str().unwrap())
-            .output_path(normalized.to_str().unwrap())
+            .input_path(TEST_PCAP)
+            .output_path(normalized.path())
             .batch()
             .unwrap();
         assert!(
-            !std::fs::read(&normalized).unwrap().is_empty(),
+            !std::fs::read(normalized.path()).unwrap().is_empty(),
             "assumed normalization to produce some output, but it did not"
         );
 
         // Spawn tshark on the normalized PCAP to actually produce an "interesting" output.
-        let output = tmp_dir.path().join("output.pcap");
+        let output = tempfile::NamedTempFile::with_suffix(".pcap")
+            .expect("Unable to create the output file");
         RTSharkBuilder::builder()
-            .input_path(normalized.to_str().unwrap())
-            .output_path(output.to_str().unwrap())
+            .input_path(normalized.path())
+            .output_path(output.path())
             .batch()
             .unwrap();
 
